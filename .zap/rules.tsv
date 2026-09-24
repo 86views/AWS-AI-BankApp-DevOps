@@ -1,0 +1,3 @@
+# OWASP ZAP baseline rules
+# Format: <rule-id>	<IGNORE|WARN|FAIL>	<url-regex>
+# Empty = use ZAP defaults. Add rules later to suppress known false positives.
