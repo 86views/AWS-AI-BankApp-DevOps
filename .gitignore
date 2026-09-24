@@ -34,3 +34,24 @@ build/
 
 ### Claude ###
 CLAUDE.md
+
+
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Secrets — never commit
+secrets.auto.tfvars
+*.auto.tfvars
+!*.auto.tfvars.example
+
+# Local overrides
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

@@ -1,47 +1,22 @@
+# Production override for app-tier
+# docker compose -f docker-compose.yml -f app-tier.yml up -d
+
 services:
-  db:
-    image: mysql:8.0
-    container_name: db
+  bankapp-mysql:
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: ${DB_NAME}
       MYSQL_USER: ${DB_USER}
       MYSQL_PASSWORD: ${DB_PASSWORD}
-    ports:
-      - "3306:3306"
-    volumes:
-      - mysql-data:/var/lib/mysql
-    restart: always
-    networks:
-      - bankapp-net
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   bankapp:
-    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-    container_name: bankapp
-    ports:
-      - "8080:8080"
+    build: !reset null
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}   # Pull from ECR instead of building
     environment:
-      MYSQL_HOST: db
-      MYSQL_PORT: ${DB_PORT:-3306}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-      OLLAMA_URL: ${OLLAMA_URL}
+      SPRING_DATASOURCE_URL: jdbc:mysql://bankapp-mysql:3306/${DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      OLLAMA_BASE_URL: ${OLLAMA_URL}   # External AI EC2
     depends_on:
-      db:
+      bankapp-mysql:
         condition: service_healthy
-    restart: always
-    networks:
-      - bankapp-net
-
-networks:
-  bankapp-net:
-    driver: bridge
-
-volumes:
-  mysql-data:

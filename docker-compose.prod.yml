@@ -1,0 +1,101 @@
+# =============================================================================
+# docker-compose.prod.yml — DevSecOps Banking App (production)
+# =============================================================================
+# Runs on EC2 (/opt/bankapp/docker-compose.yml). Tailored for t3.micro:
+#   - tuned MySQL memory
+#   - Ollama single-parallel + keep-alive
+#   - capped JVM heap
+#   - proper healthchecks
+#
+# Env vars come from /opt/bankapp/.env (written by cloud-init from SSM).
+# =============================================================================
+
+networks:
+  bankapp-net:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  ollama-data:
+
+services:
+  # ---------- MySQL ----------
+  bankapp-mysql:
+    image: mysql:8.0.40
+    container_name: bank-mysql              # matches cloud-init
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    command:
+      # Free-tier memory tuning — drops MySQL from ~400MB to ~150MB
+      - --innodb-buffer-pool-size=128M
+      - --performance-schema=OFF
+      - --max-connections=50
+      - --key-buffer-size=16M
+      - --table-open-cache=64
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - bankapp-net
+    healthcheck:
+      # mysqladmin ping returns 0 even without auth as long as server is up
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------- Ollama (AI Engine) ----------
+  bankapp-ollama:
+    image: ollama/ollama:0.6.2
+    container_name: bank-ollama              # matches cloud-init
+    restart: unless-stopped
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: "5m"                # frees ~700MB after 5m idle
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - bankapp-net
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # Note: no ports exposed — only bankapp reaches it via the docker network
+
+  # ---------- Spring Boot Application ----------
+  bankapp:
+    image: ${ECR_REPO}:${IMAGE_TAG}          # pulled from ECR (never built here)
+    container_name: bankapp
+    restart: unless-stopped
+    env_file: .env                            # reads /opt/bankapp/.env
+    depends_on:
+      bankapp-mysql:
+        condition: service_healthy
+      bankapp-ollama:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://bankapp-mysql:3306/${DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      # Co-located Ollama (free-tier mode). For a split AI EC2: http://<private-ip>:11434
+      SPRING_AI_OLLAMA_BASE_URL: http://bankapp-ollama:11434
+      SPRING_AI_OLLAMA_CHAT_OPTIONS_MODEL: tinyllama
+      JAVA_TOOL_OPTIONS: "-Xmx256m -Xss512k -XX:+UseSerialGC -XX:MaxMetaspaceSize=128m"
+    ports:
+      - "8080:8080"
+    networks:
+      - bankapp-net
+    healthcheck:
+      # Requires spring-boot-starter-actuator + management.endpoints.web.exposure.include=health
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s

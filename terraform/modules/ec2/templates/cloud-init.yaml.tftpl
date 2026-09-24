@@ -1,0 +1,279 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - unzip
+  - jq
+  - less
+  - htop
+  - net-tools
+
+write_files:
+  # ============================================================
+  # Docker daemon config — log rotation (critical on 15 GB disk)
+  # ============================================================
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: '0644'
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "3" }
+      }
+
+  # ============================================================
+  # Docker Compose stack
+  # NOTE: `$${VAR}` here survives Terraform templating and lets
+  #       docker compose read the value from /opt/bankapp/.env
+  # ============================================================
+  - path: /opt/bankapp/docker-compose.yml
+    owner: root:root
+    permissions: '0644'
+    content: |
+      services:
+        mysql:
+          image: mysql:8.0.40
+          container_name: bank-mysql
+          restart: unless-stopped
+          environment:
+            MYSQL_DATABASE: $${DB_NAME}
+            MYSQL_USER: $${DB_USER}
+            MYSQL_PASSWORD: $${DB_PASSWORD}
+            MYSQL_ROOT_PASSWORD: $${MYSQL_ROOT_PASSWORD}
+          # Free-tier memory tuning — drops MySQL from ~400MB to ~150MB
+          command:
+            - --innodb-buffer-pool-size=128M
+            - --performance-schema=OFF
+            - --max-connections=50
+            - --key-buffer-size=16M
+            - --table-open-cache=64
+          volumes:
+            - mysql-data:/var/lib/mysql
+          healthcheck:
+            test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 30s
+          networks:
+            - bank-net
+
+        ollama:
+          image: ollama/ollama:0.6.2
+          container_name: bank-ollama
+          restart: unless-stopped
+          environment:
+            OLLAMA_NUM_PARALLEL: "1"
+            OLLAMA_MAX_LOADED_MODELS: "1"
+            OLLAMA_KEEP_ALIVE: "5m"
+          volumes:
+            - ollama-data:/root/.ollama
+          healthcheck:
+            test: ["CMD", "ollama", "list"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+          networks:
+            - bank-net
+
+        bankapp:
+          image: $${ECR_REPO}:$${IMAGE_TAG}
+          container_name: bankapp
+          restart: unless-stopped
+          env_file: .env
+          depends_on:
+            mysql:
+              condition: service_healthy
+            ollama:
+              condition: service_healthy
+          environment:
+            SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/$${DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+            SPRING_DATASOURCE_USERNAME: $${DB_USER}
+            SPRING_DATASOURCE_PASSWORD: $${DB_PASSWORD}
+            SPRING_AI_OLLAMA_BASE_URL: http://ollama:11434
+            SPRING_AI_OLLAMA_CHAT_OPTIONS_MODEL: tinyllama
+            JAVA_TOOL_OPTIONS: "-Xmx256m -Xss512k -XX:+UseSerialGC -XX:MaxMetaspaceSize=128m"
+          ports:
+            - "8080:8080"
+          healthcheck:
+            test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 90s
+          networks:
+            - bank-net
+
+      volumes:
+        mysql-data:
+        ollama-data:
+
+      networks:
+        bank-net:
+          driver: bridge
+
+  # ============================================================
+  # Bootstrap script
+  # ============================================================
+  - path: /usr/local/bin/bootstrap-bankapp.sh
+    owner: root:root
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      AWS_REGION="${aws_region}"
+      ECR_REPOSITORY_URL="${ecr_repository_url}"
+      SSM_PREFIX="/${project_name}/${environment}"
+      IMAGE_TAG_DEFAULT="${image_tag}"
+
+      log()  { echo "[bootstrap] $*"; }
+      fail() { echo "[bootstrap] FATAL: $*" >&2; exit 1; }
+
+      # ===================== Docker =====================
+      if ! command -v docker &>/dev/null; then
+        log "Installing Docker..."
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+          | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+        apt-get update -y
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        systemctl enable docker
+        systemctl start docker
+        usermod -aG docker ubuntu
+      fi
+
+      # ===================== AWS CLI v2 =====================
+      if ! command -v aws &>/dev/null; then
+        log "Installing AWS CLI v2..."
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp
+        /tmp/aws/install
+        rm -rf /tmp/aws /tmp/awscliv2.zip
+      fi
+
+      # ===================== Fetch config from SSM Parameter Store =====================
+      log "Reading config from SSM Parameter Store: $SSM_PREFIX"
+
+      get_param() {
+        aws ssm get-parameter \
+          --region "$AWS_REGION" \
+          --name "$1" \
+          --with-decryption \
+          --query 'Parameter.Value' \
+          --output text 2>/dev/null
+      }
+
+      # Fail loudly if we can't reach the expected parameter
+      probe="$(get_param "$SSM_PREFIX/db/host" || true)"
+      if [ -z "$probe" ] || [ "$probe" = "None" ]; then
+        fail "Could not read $SSM_PREFIX/db/host. Check instance IAM role and SSM parameters exist."
+      fi
+
+      DB_HOST="$(get_param "$SSM_PREFIX/db/host")"
+      DB_PORT="$(get_param "$SSM_PREFIX/db/port")"
+      DB_NAME="$(get_param "$SSM_PREFIX/db/name")"
+      DB_USER="$(get_param "$SSM_PREFIX/db/user")"
+      DB_PASSWORD="$(get_param "$SSM_PREFIX/db/password")"
+      MYSQL_ROOT_PASSWORD="$(get_param "$SSM_PREFIX/db/root_password")"
+      OLLAMA_URL="$(get_param "$SSM_PREFIX/ollama/url")"
+
+      # Basic sanity check — every value must be non-empty
+      for v in DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD MYSQL_ROOT_PASSWORD OLLAMA_URL; do
+        eval "val=\$$v"
+        [ -n "$val" ] && [ "$val" != "None" ] || fail "SSM parameter for $v is empty."
+      done
+
+      mkdir -p /opt/bankapp
+      umask 077
+      cat > /opt/bankapp/.env <<ENVEOF
+      DB_HOST=$DB_HOST
+      DB_PORT=$DB_PORT
+      DB_NAME=$DB_NAME
+      DB_USER=$DB_USER
+      DB_PASSWORD=$DB_PASSWORD
+      MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+      OLLAMA_URL=$OLLAMA_URL
+      ECR_REPO=$ECR_REPOSITORY_URL
+      IMAGE_TAG=$IMAGE_TAG_DEFAULT
+      ENVEOF
+      chmod 600 /opt/bankapp/.env
+      unset DB_PASSWORD MYSQL_ROOT_PASSWORD
+      log "Wrote /opt/bankapp/.env (mode 600)"
+
+      # ===================== ECR login =====================
+      log "Logging into ECR..."
+      aws ecr get-login-password --region "$AWS_REGION" \
+        | docker login --username AWS --password-stdin "$${ECR_REPOSITORY_URL%%/*}"
+
+      cd /opt/bankapp
+
+      # ===================== Is any image in ECR yet? =====================
+      REPO_NAME="$${ECR_REPOSITORY_URL##*/}"
+      if ! aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$REPO_NAME" >/dev/null 2>&1; then
+        log "ECR repo '$REPO_NAME' has no images yet — starting dependencies only."
+        log "The GitHub Actions pipeline will push and deploy the app."
+        docker compose pull mysql ollama
+        docker compose up -d mysql ollama
+        exit 0
+      fi
+
+      # ===================== Start dependencies first =====================
+      log "Pulling mysql + ollama images..."
+      docker compose pull mysql ollama
+
+      log "Starting mysql + ollama..."
+      docker compose up -d mysql ollama
+
+      log "Waiting for MySQL and Ollama to become healthy..."
+      for i in $(seq 1 60); do
+        m=$(docker inspect --format='{{.State.Health.Status}}' bank-mysql  2>/dev/null || echo "starting")
+        o=$(docker inspect --format='{{.State.Health.Status}}' bank-ollama 2>/dev/null || echo "starting")
+        if [ "$m" = "healthy" ] && [ "$o" = "healthy" ]; then
+          log "MySQL and Ollama healthy (after ~$(( i * 5 ))s)"
+          break
+        fi
+        sleep 5
+      done
+
+      # ===================== Pull model BEFORE starting app =====================
+      log "Pulling TinyLlama model (first boot may take several minutes)..."
+      if ! docker exec bank-ollama ollama pull tinyllama; then
+        log "WARNING: tinyllama pull failed. Retry manually with:"
+        log "  docker exec bank-ollama ollama pull tinyllama"
+      fi
+
+      # ===================== Start the application =====================
+      log "Starting bankapp (tag: $IMAGE_TAG_DEFAULT)..."
+      docker compose pull bankapp
+      docker compose up -d bankapp
+
+      log "Bootstrap complete. Check status: docker compose ps"
+
+runcmd:
+  # ---- Enable 2 GB swap — ESSENTIAL on t3.micro (1 GB RAM) ----
+  - |
+    if [ ! -f /swapfile ]; then
+      fallocate -l 2G /swapfile
+      chmod 600 /swapfile
+      mkswap /swapfile
+      swapon /swapfile
+      echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+  - mkdir -p /opt/bankapp
+  - /usr/local/bin/bootstrap-bankapp.sh
+
+final_message: "bankapp bootstrap finished after $UPTIME seconds"

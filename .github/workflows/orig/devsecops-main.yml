@@ -1,0 +1,161 @@
+name: DevSecOps Master Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  devsecops-end-to-end:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # OWASP may take long
+
+    steps:
+      # ---------- Gate 1: Secret Scan ----------
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate 1 - Secret Scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Fails if secrets are found.
+
+      # ---------- Gate 2: Lint ----------
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Gate 2 - Java Linting (Checkstyle)
+        run: mvn checkstyle:check
+        # Removed the || echo – now fails on violations.
+
+      # ---------- Gate 3: SAST ----------
+      - name: Gate 3 - SAST (Semgrep)
+        run: |
+          pip install semgrep
+          semgrep scan --config auto --error
+
+      # ---------- Gate 4: SCA ----------
+      - name: Gate 4 - SCA (OWASP Dependency Check)
+        run: |
+          mvn org.owasp:dependency-check-maven:check \
+            -Dformat=HTML \
+            -DoutputDirectory=target/dependency-check \
+            -DfailOnError=false
+        continue-on-error: true   # So the report is generated even if CVEs exist
+
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: target/dependency-check/*.html
+
+      # ---------- Gate 5: Build ----------
+      - name: Gate 5 - Maven Build
+        run: mvn clean package -DskipTests=true
+
+      # ---------- AWS Authentication & ECR Login ----------
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------- Gate 6: Build Docker Image ----------
+      - name: Build Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # ---------- Gate 7: Container Scan (Trivy) ----------
+      - name: Gate 7 - Container Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # ---------- Gate 8: Push to ECR ----------
+      - name: Gate 8 - Push Image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # ---------- Gate 9: Deploy via SSM ----------
+      - name: Gate 9 - Deploy to EC2 via SSM Run Command
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          OLLAMA_URL: ${{ secrets.OLLAMA_URL }}   # e.g., http://10.0.1.100:11434
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build the SSM command script
+          COMMAND="
+            set -e
+            # 1. Log in to ECR
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
+
+            # 2. Retrieve secrets from AWS Secrets Manager
+            SECRET_JSON=\$(aws secretsmanager get-secret-value --secret-id bankapp/prod-secrets --query SecretString --output text)
+
+            # 3. Export environment variables
+            export DB_NAME=\$(echo \$SECRET_JSON | jq -r '.DB_NAME')
+            export DB_USER=\$(echo \$SECRET_JSON | jq -r '.DB_USER')
+            export DB_PASSWORD=\$(echo \$SECRET_JSON | jq -r '.DB_PASSWORD')
+            export MYSQL_ROOT_PASSWORD=\$(echo \$SECRET_JSON | jq -r '.MYSQL_ROOT_PASSWORD')
+            export OLLAMA_URL=${OLLAMA_URL}
+
+            # 4. ECR details
+            export ECR_REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
+            export ECR_REPOSITORY=${ECR_REPOSITORY}
+            export IMAGE_TAG=${IMAGE_TAG}
+
+            # 5. Deploy using the production compose file
+            cd /home/ubuntu/app
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+          "
+
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=instanceIds,Values=$INSTANCE_ID" \
+            --parameters commands=["$COMMAND"] \
+            --comment "Deploy from GitHub Actions DevSecOps pipeline" \
+            --region us-east-1
+
+      # ---------- Gate 10: DAST (OWASP ZAP) ----------
+      - name: Gate 10 - DAST Scanning (OWASP ZAP)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target: 'http://${{ secrets.EC2_PUBLIC_IP }}:8080'
+          issue_title: 'OWASP ZAP DAST Security Assessment Report'
+        # Note: This requires your EC2 security group to allow inbound 8080 from GitHub Actions IPs
+        # Alternatively, you can run ZAP from inside the VPC using a separate scanner.

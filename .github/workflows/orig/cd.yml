@@ -1,0 +1,71 @@
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Required for OIDC authentication
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}   # IAM role with necessary permissions
+          aws-region: us-east-1
+
+      - name: Get EC2 Instance ID (from secret or hardcoded)
+        id: get-instance
+        run: |
+          # You can either store the instance ID as a secret or retrieve it via tags
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+      - name: Deploy via SSM Run Command
+        run: |
+          INSTANCE_ID="${{ steps.get-instance.outputs.instance_id }}"
+          # Build the SSM command script
+          COMMAND="
+            set -e
+
+            # 1. Log in to ECR
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+            # 2. Retrieve secrets from AWS Secrets Manager
+            SECRET_JSON=\$(aws secretsmanager get-secret-value --secret-id bankapp/prod-secrets --query SecretString --output text)
+            
+            # 3. Export all required environment variables
+            export DB_NAME=\$(echo \$SECRET_JSON | jq -r '.DB_NAME')
+            export DB_USER=\$(echo \$SECRET_JSON | jq -r '.DB_USER')
+            export DB_PASSWORD=\$(echo \$SECRET_JSON | jq -r '.DB_PASSWORD')
+            export MYSQL_ROOT_PASSWORD=\$(echo \$SECRET_JSON | jq -r '.MYSQL_ROOT_PASSWORD')
+            # OLLAMA_URL may also be stored in the secret, or set explicitly
+            export OLLAMA_URL=${{ secrets.OLLAMA_URL }}   # e.g., http://<AI-EC2-private-ip>:11434
+
+            # 4. ECR repository details
+            export ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+            export ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}
+            export IMAGE_TAG=latest   # or use a dynamic tag from CI, but we assume 'latest'
+
+            # 5. Navigate to application directory and redeploy
+            cd /home/ubuntu/app
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+          "
+
+          # Send the command to the EC2 instance via SSM
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=instanceIds,Values=$INSTANCE_ID" \
+            --parameters commands=["$COMMAND"] \
+            --comment "Deploy from GitHub Actions CD" \
+            --region us-east-1

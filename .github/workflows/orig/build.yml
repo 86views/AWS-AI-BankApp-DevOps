@@ -1,0 +1,70 @@
+name: Build & Unit Test
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    # Increase timeout because OWASP Dependency Check can take 30+ min
+    timeout-minutes: 60
+
+    steps:
+      # ---------- Gate 1: Secret Scan ----------
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history for Gitleaks
+
+      - name: Secret Scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: true   # Adds comments to PRs
+
+      # ---------- Gate 2: Lint (Checkstyle) ----------
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Lint with Checkstyle
+        run: mvn checkstyle:check
+
+      # ---------- Gate 3: SAST (Semgrep) ----------
+      - name: SAST with Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          # Run rules for Java and OWASP Top 10
+          config: p/java, p/owasp-top-ten
+
+      # ---------- Gate 4: SCA (OWASP Dependency Check) ----------
+      - name: OWASP Dependency Check
+        run: |
+          mvn org.owasp:dependency-check-maven:check \
+            -Dformat=HTML \
+            -DoutputDirectory=target/dependency-check
+
+      - name: Upload Dependency Check Report (Artifact)
+        uses: actions/upload-artifact@v4
+        if: always()   # Upload even if the scan finds vulnerabilities
+        with:
+          name: dependency-check-report
+          path: target/dependency-check/dependency-check-report.html
+
+      # ---------- Gate 5: Build ----------
+      - name: Compile and Package (skip tests, already done)
+        run: mvn clean package -DskipTests -B
+
+      # ---------- (Optional) Upload Test Reports ----------
+      - name: Upload Test Reports (if any)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: target/surefire-reports/

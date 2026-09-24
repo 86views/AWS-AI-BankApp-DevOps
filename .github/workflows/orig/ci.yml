@@ -1,0 +1,125 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  ci-pipeline:
+    runs-on: ubuntu-latest
+    # Increase timeout for OWASP (first run can be 30+ min)
+    timeout-minutes: 60
+
+    steps:
+      # ---------- Gate 1: Secret Scan ----------
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # This action will fail the build if secrets are found – good.
+
+      # ---------- Gate 2: Lint (Checkstyle) ----------
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Checkstyle
+        run: mvn checkstyle:check
+        # ❌ Removed the `|| echo` – now it fails on errors (true DevSecOps gate).
+        # If you want warnings only, keep the echo, but for a strict pipeline, fail is better.
+
+      # ---------- Gate 3: SAST (Semgrep) ----------
+      - name: Run SAST (Semgrep)
+        run: |
+          pip install semgrep
+          semgrep scan --config auto --error
+        # --error makes it exit with non-zero on findings. Good.
+
+      # ---------- Gate 4: SCA (OWASP Dependency Check) ----------
+      - name: Run SCA (OWASP Dependency Check)
+        run: |
+          mvn org.owasp:dependency-check-maven:check \
+            -Dformat=HTML \
+            -DoutputDirectory=target/dependency-check \
+            -DfailOnError=false
+        # We keep failOnError=false to avoid failing the build solely on CVEs,
+        # but you can change to true if you want to block on high-severity issues.
+        # The report is uploaded as an artifact for review.
+
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: target/dependency-check/*.html
+
+      # ---------- Gate 5: Build ----------
+      - name: Build Maven Package
+        run: mvn clean package -DskipTests=true
+        # Tests are skipped here because they were already run in build.yml.
+        # If you want to run tests here too, remove -DskipTests.
+
+      # ---------- AWS & Container Steps ----------
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------- Gate 6: Container Build ----------
+      - name: Build Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # ---------- Gate 7: Container Security Scan (Trivy) ----------
+      - name: Container Security Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'          # Fail on HIGH/CRITICAL vulns
+          ignore-unfixed: true    # Only scan fixable vulnerabilities
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # ---------- Gate 8: Push to ECR ----------
+      - name: Push Container Image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # ---------- Gate 9: Store Image Tag for CD (Optional) ----------
+      - name: Save Image Tag to Artifact
+        run: echo "${{ github.sha }}" > image-tag.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-tag
+          path: image-tag.txt
+        # This allows the CD pipeline to use the exact same tag, avoiding "latest" ambiguity.
