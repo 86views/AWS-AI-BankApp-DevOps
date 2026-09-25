@@ -149,9 +149,12 @@ module "iam" {
   enable_ssm_deploy        = var.enable_ssm_deploy
   permissions_boundary_arn = var.permissions_boundary_arn
 
-  github_org    = var.github_org
-  github_repo   = var.github_repo
-  github_branch = var.github_branch
+  github_org      = var.github_org
+  github_repo     = var.github_repo
+  github_branch   = var.github_branch
+  github_owner_id = var.github_owner_id
+  github_repo_id  = var.github_repo_id
+
 }
 
 # =============================================================================

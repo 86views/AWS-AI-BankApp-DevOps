@@ -61,6 +61,16 @@ variable "github_branch" {
   default     = "main"
 }
 
+variable "github_owner_id" {
+  description = "GitHub owner numeric ID"
+  type        = string
+}
+
+variable "github_repo_id" {
+  description = "GitHub repository numeric ID"
+  type        = string
+}
+
 
 # =============================================================================
 # Existing (already declared in your file)

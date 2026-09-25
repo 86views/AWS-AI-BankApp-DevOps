@@ -24,9 +24,11 @@ tags = {}
 # GitHub OIDC — source repo for the GitHubActionsRole trust policy
 # -----------------------------------------------------------------------------
 
-github_org    = "86views" # ⚠️ replace with your GitHub user or org
-github_repo   = "AWS-AI-BankApp-DevOps"
-github_branch = "main"
+github_org      = "86views" # ⚠️ replace with your GitHub user or org
+github_repo     = "AWS-AI-BankApp-DevOps"
+github_branch   = "main"
+github_owner_id = "21120209"   # from step 1
+github_repo_id  = "1383129666" # from step 1
 
 # -----------------------------------------------------------------------------
 # Networking (VPC module)
