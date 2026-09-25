@@ -50,7 +50,7 @@ graph TD
     GH -->|2. Push Scanned Image| ECR
     GH -->|3. SSH Orchestration| AppEC2
     GH -->|4. DAST Scan| AppEC2
-    
+
     User -->|Port 8080| AppEC2
     AppEC2 -->|JDBC Connection| DB
     AppEC2 -->|REST Integration| Ollama
@@ -106,7 +106,7 @@ The CI/CD pipeline enforces **9 sequential security gates** before any code reac
       ```bash
       #!/bin/bash
 
-      sudo apt update 
+      sudo apt update
       sudo apt install -y docker.io docker-compose-v2 jq
       sudo usermod -aG docker ubuntu
       sudo newgrp docker
@@ -126,7 +126,7 @@ The CI/CD pipeline enforces **9 sequential security gates** before any code reac
    - Attach it to Application EC2. Select EC2 -> Actions -> Security -> Modify IAM role -> Attach created IAM role.
 
       ![IAM role](screenshots/4.png)
-   
+
    - Connect to EC2 Instance and Run below command to check whether IAM role is working or not.
 
       ```bash
@@ -140,11 +140,11 @@ The CI/CD pipeline enforces **9 sequential security gates** before any code reac
    - Open Inbound Port `11434` from the Application EC2 Security Group.
 
       > Better to give `name` to Security Group created.
-    
+
       ![ollama-sg](screenshots/8.png)
 
    - Automate initialization using the [ollama-setup.sh](scripts/ollama-setup.sh) script via EC2 User Data.
-    
+
       ![user-data](screenshots/9.png)
 
    - Verify the AI engine is responsive and the model is pulled in `AI engine EC2`:
@@ -238,7 +238,7 @@ Configure the following Action Secrets within your GitHub repository settings:
 
 - Click the **activation link** in the email.
 - Enter `UUID` provided in email and Enter `Email` to activate
-- The link confirms your key and marks it as active.  
+- The link confirms your key and marks it as active.
 
    ![api-activate](screenshots/23.png)
 
@@ -284,7 +284,7 @@ All scan reports (OWASP, Trivy, ZAP) are uploaded as downloadable **Artifacts** 
 - Artifacts
 
    ![artifacts](screenshots/26.png)
-   
+
 ---
 
 ## Operational Verification
@@ -297,7 +297,7 @@ All scan reports (OWASP, Trivy, ZAP) are uploaded as downloadable **Artifacts** 
 
   ![app](screenshots/20.png)
 
-- **Database Connectivity**: 
+- **Database Connectivity**:
 
   ```bash
   docker exec -it db mysql -u <USER> -p bankappdb -e "SELECT * FROM accounts;"
@@ -307,7 +307,7 @@ All scan reports (OWASP, Trivy, ZAP) are uploaded as downloadable **Artifacts** 
 
   > **ZAP** is automatically created by **DAST - OWASP ZAP Baseline Scan** job in [cd.yml](.github/workflows/cd.yml). Read more about it(How, Why it does) on google...
 
-- **Network Validation**: 
+- **Network Validation**:
 
   ```bash
   nc -zv <OLLAMA-PRIVATE-IP> 11434
@@ -321,6 +321,8 @@ All scan reports (OWASP, Trivy, ZAP) are uploaded as downloadable **Artifacts** 
 
 Happy Learning
 
-**TrainWithShubham**  
+  Design By @86views OLULEYE OLUSEUN
+
+
 
 </div>

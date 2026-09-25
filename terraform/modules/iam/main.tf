@@ -105,8 +105,8 @@ data "aws_iam_policy_document" "ec2_policy" {
 }
 
 resource "aws_iam_role_policy" "ec2" {
-  name  = "${var.project_name}-ec2-policy"
-  role  = aws_iam_role.ec2.id
+  name   = "${var.project_name}-ec2-policy"
+  role   = aws_iam_role.ec2.id
   policy = data.aws_iam_policy_document.ec2_policy.json
 }
 
@@ -144,7 +144,12 @@ data "aws_iam_policy_document" "github_assume_role" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_org}/${var.github_repo}:ref:refs/heads/${var.github_branch}"]
+      values = [
+        # Old format (no IDs)
+        "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/${var.github_branch}",
+        # New format (with owner + repo IDs)
+        "repo:${var.github_org}@*/${var.github_repo}@*:ref:refs/heads/${var.github_branch}",
+      ]
     }
   }
 }
@@ -183,7 +188,7 @@ data "aws_iam_policy_document" "github_actions_policy" {
     sid       = "EC2Describe"
     effect    = "Allow"
     actions   = ["ec2:DescribeInstances"]
-    resources = ["*"]   # DescribeInstances doesn't support resource ARNs
+    resources = ["*"] # DescribeInstances doesn't support resource ARNs
   }
 
   statement {
@@ -252,7 +257,7 @@ data "aws_iam_policy_document" "github_actions_policy" {
 }
 
 resource "aws_iam_role_policy" "github_actions" {
-  name  = "${var.project_name}-github-actions-policy"
-  role  = aws_iam_role.github_actions.id
+  name   = "${var.project_name}-github-actions-policy"
+  role   = aws_iam_role.github_actions.id
   policy = data.aws_iam_policy_document.github_actions_policy.json
 }
