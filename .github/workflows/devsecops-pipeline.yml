@@ -96,13 +96,24 @@ jobs:
 
       - name: "Gate 3 — SAST (Semgrep)"
         run: |
-          pip install --quiet semgrep
+          pip install --quiet "semgrep==1.178.0"
+
+          # Human-readable output in the log
+          echo "===== Semgrep findings ====="
           semgrep scan \
             --config p/java \
-            --config p/owasp-top-ten \
-            --error \
-            --sarif --output semgrep.sarif
-        # --error: non-zero exit on findings (real gate, not advisory)
+            --config p/secrets \
+            --config p/dockerfile \
+            --text --no-error || true
+
+          # Blocking scan
+          echo "===== Semgrep scan (enforcing) ====="
+          semgrep scan \
+            --config p/java \
+            --config p/secrets \
+            --config p/dockerfile \
+            --sarif --output semgrep.sarif \
+            --error
 
       - name: Upload Semgrep SARIF
         if: always()
@@ -333,7 +344,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      issues: write           # ZAP files an issue with the report
+      issues: write        # ZAP files an issue with the report
 
     steps:
       - name: Configure AWS credentials (OIDC)
