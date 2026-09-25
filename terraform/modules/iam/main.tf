@@ -147,6 +147,8 @@ data "aws_iam_policy_document" "github_assume_role" {
       values = [
         "repo:${var.github_org}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}:ref:refs/heads/${var.github_branch}",
         "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/${var.github_branch}",
+        "repo:${var.github_org}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}:pull_request",
+        "repo:${var.github_org}/${var.github_repo}:pull_request",
       ]
     }
   }
