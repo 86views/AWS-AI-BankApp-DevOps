@@ -7,12 +7,12 @@
 #   3. SAST              — Semgrep
 #   4. SCA               — OWASP Dependency Check (cached)
 #   5. Build             — Maven
-#   6. Container Build   — Docker (+ Trivy scan before anything is pushed)
-#   7. Container Scan    — Trivy, then Push to Amazon ECR (IMMUTABLE, tag = git SHA)
+#   6. Container Scan    — Trivy
+#   7. Push              — Amazon ECR (IMMUTABLE, tag = git SHA)
 #   8. Deploy            — SSM Send-Command (keyless, no SSH)
 #   9. DAST              — OWASP ZAP Baseline
 #
-# Auth: GitHub OIDC -> AWS IAM role (no long-lived keys)
+# Auth: GitHub OIDC → AWS IAM role (no long-lived keys)
 # Config: SSM Parameter Store (no Secrets Manager)
 # Tag: git SHA only (never :latest — ECR repo is IMMUTABLE)
 # =============================================================================
@@ -43,7 +43,7 @@ jobs:
   ci:
     name: "CI — Build, Scan, Push"
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
@@ -121,32 +121,24 @@ jobs:
         with:
           name: semgrep-report
           path: semgrep.sarif
-          if-no-files-found: ignore
 
       # =====================================================================
-      # Gate 4 — SCA (OWASP Dependency Check) with resilient NVD cache
+      # Gate 4 — SCA (OWASP Dependency Check) with cache
       # =====================================================================
-      # Cache is restored first and saved IMMEDIATELY after the scan
-      # (if: always()), so the slow NVD download survives later failures
-      # or cancelled runs. Add NVD_API_KEY as a repo secret to cut the first
-      # download from 30+ min to a few minutes:
-      #   https://nvd.nist.gov/developers/request-an-api-key
-      # Bump the -v1 suffix in both keys to force a fresh download.
 
-      - name: Restore NVD cache
-        id: nvd-cache
-        uses: actions/cache/restore@v4
+      - name: Cache OWASP Dependency Check NVD data
+        uses: actions/cache@v4
         with:
           path: ~/.cache/dependency-check
-          key: owasp-dc-${{ runner.os }}-v1
+          key: owasp-dc-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             owasp-dc-${{ runner.os }}-
 
       - name: "Gate 4 — SCA (OWASP Dependency Check)"
-        timeout-minutes: 45
-        # Report is the artifact; blocking rules (CVSS) are set in pom.xml.
-        continue-on-error: true
         env:
+          # Optional: add NVD_API_KEY as a GitHub Secret to cut first run
+          # from ~30 min to ~2 min. Get one free at:
+          # https://nvd.nist.gov/developers/request-an-api-key
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           mkdir -p ~/.cache/dependency-check
@@ -156,13 +148,9 @@ jobs:
             -DdataDirectory="$HOME/.cache/dependency-check" \
             -DnvdApiKey="$NVD_API_KEY" \
             -DfailOnError=false
-
-      - name: Save NVD cache
-        if: always() && steps.nvd-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/dependency-check
-          key: owasp-dc-${{ runner.os }}-v1
+        # failOnError=false → report is generated even when CVEs exist.
+        # The report is the artifact; blocking rules are set on CVSS in pom.xml.
+        continue-on-error: true
 
       - name: Upload Dependency Check report
         if: always()
@@ -170,7 +158,6 @@ jobs:
         with:
           name: dependency-check-report
           path: target/dependency-check/*.html
-          if-no-files-found: ignore
 
       # =====================================================================
       # Gate 5 — Build (Maven)
@@ -188,8 +175,22 @@ jobs:
           if-no-files-found: ignore
 
       # =====================================================================
-      # AWS OIDC login (keyless) — UNCHANGED
+      # AWS OIDC login (keyless)
       # =====================================================================
+
+      - name: Debug OIDC token
+        run: |
+          curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+            | jq -r '.value' | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+
+          echo "===== Role ARN we will assume ====="
+          echo "${{ secrets.AWS_ROLE_ARN }}"
+
+      - name: Verify AWS_ROLE_ARN secret matches expected value
+        run: |
+          echo -n "${{ secrets.AWS_ROLE_ARN }}" | sha256sum
+          echo -n "arn:aws:iam::173331852212:role/devsecops-bankapp-GitHubActionsRole" | sha256sum
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -221,17 +222,12 @@ jobs:
       # =====================================================================
 
       - name: "Gate 7 — Container Scan (Trivy)"
-        timeout-minutes: 15
         env:
           IMAGE_REF: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
-          # Pull vulnerability DBs from the AWS public ECR mirror (avoids
-          # GHCR rate-limit stalls)
-          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
-          TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db:1
         run: |
           set -euo pipefail
 
-          # Install Trivy CLI from the official apt repo
+          # Install Trivy CLI directly (official install script)
           sudo apt-get install -y wget apt-transport-https gnupg
           wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
@@ -240,25 +236,23 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
+          # Verify installation
           trivy --version
 
-          # Scan and fail on HIGH/CRITICAL (secrets already covered by Gitleaks)
+          # Scan and fail on HIGH/CRITICAL
           trivy image \
             --exit-code 1 \
             --ignore-unfixed \
-            --pkg-types os,library \
-            --scanners vuln \
+            --vuln-type os,library \
             --severity HIGH,CRITICAL \
             --no-progress \
-            --timeout 10m \
             "$IMAGE_REF"
 
-      - name: "Gate 7 — Push image to ECR"
+      - name: "Push container image to ECR"
         env:
           IMAGE_REF: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
         run: |
           docker push "$IMAGE_REF"
-          echo "Pushed: $IMAGE_REF"
 
   # ===========================================================================
   # CD — Gate 8: Deploy via SSM Send-Command (keyless)
@@ -275,7 +269,6 @@ jobs:
       contents: read
 
     steps:
-      # AWS OIDC login — UNCHANGED
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -292,8 +285,8 @@ jobs:
           set -euo pipefail
 
           # Build a here-doc script that runs ON the instance.
-          # The heredoc delimiter is quoted, so nothing is expanded on this
-          # runner; placeholders are substituted explicitly below.
+          # Every $VAR is escaped with \$ so the EC2 shell expands it,
+          # not this GitHub runner shell.
           SCRIPT=$(cat <<'EOSCRIPT'
           set -euo pipefail
           cd /opt/bankapp
@@ -382,7 +375,6 @@ jobs:
       issues: write       # ZAP files an issue with the report
 
     steps:
-      # AWS OIDC login — UNCHANGED
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -428,4 +420,3 @@ jobs:
         with:
           name: zap-report
           path: report_html.html
-          if-no-files-found: ignore
