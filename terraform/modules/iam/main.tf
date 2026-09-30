@@ -247,8 +247,11 @@ data "aws_iam_policy_document" "github_actions_policy" {
   }
 
   # ---------------------------------------------------------------------------
-  # SSM Send-Command — keyless deploy to the EC2 instance (Gate 8)
-  # Only needed if you choose SSM-based deploy instead of SSH.
+  # SSM Send-Command — keyless deploy to the EC2 instance (Gate 8).
+  # SendCommand can be scoped to specific instance/document ARNs, but
+  # GetCommandInvocation and ListCommandInvocations do NOT support
+  # resource-level permissions — AWS requires "*" for those or they are
+  # silently denied. Split into two statements accordingly.
   # ---------------------------------------------------------------------------
 
   dynamic "statement" {
@@ -258,13 +261,24 @@ data "aws_iam_policy_document" "github_actions_policy" {
       effect = "Allow"
       actions = [
         "ssm:SendCommand",
-        "ssm:GetCommandInvocation",
-        "ssm:ListCommandInvocations",
       ]
       resources = [
         "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
         "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
       ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_ssm_deploy ? [1] : []
+    content {
+      sid    = "SSMCommandStatus"
+      effect = "Allow"
+      actions = [
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+      ]
+      resources = ["*"]
     }
   }
 }

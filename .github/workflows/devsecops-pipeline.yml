@@ -267,21 +267,16 @@ jobs:
           echo "Pushed: $IMAGE_REF"
 
   # ===========================================================================
-  # CD — Gate 8: Deploy via SSM Send-Command (keyless)
+  # Gate 8 — Deploy via SSM Send-Command
   # ===========================================================================
   deploy:
-    name: "CD — Deploy to EC2 via SSM"
+    name: "Gate 8 — Deploy (SSM)"
     runs-on: ubuntu-latest
-    needs: ci
+    needs: [ci]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    timeout-minutes: 15
-
-    permissions:
-      id-token: write
-      contents: read
+    timeout-minutes: 20
 
     steps:
-      # AWS OIDC login — UNCHANGED
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -297,10 +292,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build a here-doc script that runs ON the instance.
+          # Build the script that runs ON the instance.
+          # #!/bin/bash as the FIRST line tells the SSM agent to execute
+          # this with bash instead of the default /bin/sh (dash), which
+          # does not support `set -o pipefail`.
           # The heredoc delimiter is quoted, so nothing is expanded on this
           # runner; placeholders are substituted explicitly below.
           SCRIPT=$(cat <<'EOSCRIPT'
+          #!/bin/bash
           set -euo pipefail
           cd /opt/bankapp
 
@@ -334,13 +333,23 @@ jobs:
           echo "$SCRIPT"
           echo "-------------------------------"
 
+          # Build the SSM parameters as a real JSON file using jq, splitting
+          # the script into a proper JSON array of lines. This avoids the
+          # AWS CLI's shorthand "commands=..." parser mangling embedded
+          # newlines/quotes into literal characters (the root cause of the
+          # earlier "pipefailncd" corruption).
+          PARAMS_FILE=$(mktemp)
+          jq -n --arg script "$SCRIPT" '{commands: ($script \vert{} split("\n"))}' > "$PARAMS_FILE"
+
           COMMAND_ID=$(aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --targets "Key=instanceIds,Values=$INSTANCE_ID" \
-            --parameters "commands=$(printf '%s' "$SCRIPT" | jq -Rs .)" \
-            --comment "Deploy $IMAGE_TAG from GitHub Actions run $GITHUB_RUN_ID" \
+            --parameters file://"$PARAMS_FILE" \
+            --comment "Deploy $IMAGE_TAG from GitHub Actions run$GITHUB_RUN_ID" \
             --query 'Command.CommandId' \
             --output text)
+
+          rm -f "$PARAMS_FILE"
 
           echo "Command ID: $COMMAND_ID"
 
