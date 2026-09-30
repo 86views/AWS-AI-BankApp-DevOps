@@ -63,5 +63,5 @@ variable "untagged_expire_days" {
 variable "force_delete" {
   description = "Allow terraform destroy to delete the repo even with images. Keep false unless you know what you're doing."
   type        = bool
-  default     = false
+  default     = true
 }

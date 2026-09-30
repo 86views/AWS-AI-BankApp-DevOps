@@ -15,9 +15,13 @@ resource "aws_ecr_repository" "bankapp" {
   image_tag_mutability = "IMMUTABLE"
   force_delete         = var.force_delete
 
+
+
   image_scanning_configuration {
     scan_on_push = true # free basic scanning (OS + library CVEs)
   }
+
+
 
   encryption_configuration {
     encryption_type = "AES256" # KMS would cost extra; AES256 is fine for free tier
