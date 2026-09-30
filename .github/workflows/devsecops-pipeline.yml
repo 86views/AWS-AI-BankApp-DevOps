@@ -224,8 +224,8 @@ jobs:
         timeout-minutes: 15
         env:
           IMAGE_REF: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
-          # Pull vulnerability DBs from the AWS public ECR mirror (avoids
-          # GHCR rate-limit stalls)
+          # Pull vulnerability DBs from the AWS public ECR mirror. Requires
+          # docker login below — anonymous pulls get rate-limited.
           TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
           TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db:1
         run: |
@@ -241,6 +241,12 @@ jobs:
           sudo apt-get install -y trivy
 
           trivy --version
+
+          # Authenticate to the public ECR mirror to raise the DB pull rate
+          # limit above the anonymous quota (needs ecr-public:GetAuthorizationToken
+          # on the GitHub Actions role — already added via Terraform)
+          aws ecr-public get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin public.ecr.aws
 
           # Scan and fail on HIGH/CRITICAL (secrets already covered by Gitleaks)
           trivy image \

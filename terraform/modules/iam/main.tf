@@ -123,6 +123,7 @@ resource "aws_iam_instance_profile" "ec2" {
 # GitHub Actions OIDC Role — keyless CI/CD (no long-lived AWS keys)
 # =============================================================================
 # Trust is scoped to a specific repo + branch, using your EXISTING provider.
+# UNCHANGED — do not modify this block.
 
 data "aws_iam_policy_document" "github_assume_role" {
   statement {
@@ -178,6 +179,18 @@ data "aws_iam_policy_document" "github_actions_policy" {
     sid       = "ECRAuthToken"
     effect    = "Allow"
     actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  # ---------------------------------------------------------------------------
+  # ECR Public — auth to the public.ecr.aws mirror (raises Trivy's anonymous
+  # pull rate limit when downloading the vulnerability DB in Gate 7)
+  # ---------------------------------------------------------------------------
+
+  statement {
+    sid       = "ECRPublicAuthToken"
+    effect    = "Allow"
+    actions   = ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"]
     resources = ["*"]
   }
 
