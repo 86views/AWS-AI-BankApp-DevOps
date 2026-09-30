@@ -321,8 +321,6 @@ All scan reports (OWASP, Trivy, ZAP) are uploaded as downloadable **Artifacts** 
 
 Happy Learning
 
-  Design By @86views OLULEYE OLUSEUN  AWS EXPERT
-
-
+  Design By @86views OLULEYE OLUSEUN  AWS and TERRAFORM EXPERT
 
 </div>
